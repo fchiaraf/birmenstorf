@@ -26,20 +26,28 @@
 // Build: same CMake as normalize_images — target inpaint_tiff (OpenCV core, imgcodecs, imgproc, photo).
 // =============================================================================
 
+#include "linear_inpaint.hpp"
+
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/photo.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <random>
 #include <string>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -53,7 +61,8 @@ static void print_usage(const char *exe) {
         << "  --radius <pixels>   inpaint radius (default: 3). Try 2–5 for small "
            "defects;\n"
         << "                      larger gaps may need larger radius (slower).\n"
-        << "  --algorithm telea|ns   (default: telea)\n"
+        << "  --algorithm telea|ns|linear   (default: telea; linear ignores "
+           "--radius)\n"
         << "  --nan-fill <float>  replace NaN/Inf before inpaint and fix stragglers "
            "after (default: 1.0)\n"
         << "  --inpaint-noise-scale <float>  if > 0, add Gaussian noise on inpainted "
@@ -237,14 +246,20 @@ static bool align_borderless_image_mask(cv::Mat *img32, cv::Mat *mask_u8) {
     return false;
 }
 
+// Sentinel: use separable linear + Jacobi inpaint (not an OpenCV enum value).
+static constexpr int kInpaintAlgoLinear = -1;
+
 static int process_one(const fs::path &in_path,
                        const fs::path &out_path,
-                       cv::Mat &mask_u8,
+                       const cv::Mat &mask_u8,
                        double radius,
                        int inpaint_algo,
                        float nan_fill,
                        float inpaint_noise_scale,
-                       std::mt19937 &rng) {
+                       uint64_t rng_seed) {
+    cv::Mat mask_work = mask_u8.clone();
+    std::mt19937 rng(rng_seed);
+
     cv::Mat img = cv::imread(in_path.string(), cv::IMREAD_UNCHANGED);
     if (img.empty()) {
         std::cerr << "Error: could not read: " << in_path << "\n";
@@ -254,10 +269,10 @@ static int process_one(const fs::path &in_path,
     if (!to_float32(img, &img32)) {
         return 1;
     }
-    if (!align_borderless_image_mask(&img32, &mask_u8)) {
+    if (!align_borderless_image_mask(&img32, &mask_work)) {
         std::cerr << "Error: size mismatch image vs mask for: " << in_path << "\n";
         std::cerr << "  image: " << img32.cols << " x " << img32.rows << "   mask: "
-                  << mask_u8.cols << " x " << mask_u8.rows << "\n";
+                  << mask_work.cols << " x " << mask_work.rows << "\n";
         std::cerr << "  (Borderless alignment allows exactly 2 pixels difference in "
                      "width and height; otherwise sizes must match.)\n";
         return 1;
@@ -266,12 +281,17 @@ static int process_one(const fs::path &in_path,
     cv::Mat nan_mask;
     nonfinite_mask_u8(img32, &nan_mask);
     cv::Mat mask_use;
-    cv::bitwise_or(mask_u8, nan_mask, mask_use);
+    cv::bitwise_or(mask_work, nan_mask, mask_use);
 
     replace_nonfinite(img32, nan_fill);
 
     cv::Mat filled;
-    cv::inpaint(img32, mask_use, filled, radius, inpaint_algo);
+    if (inpaint_algo == kInpaintAlgoLinear) {
+        img32.copyTo(filled);
+        linearInpaintMaskedRowsThenCols(filled, mask_use, nullptr);
+    } else {
+        cv::inpaint(img32, mask_use, filled, radius, inpaint_algo);
+    }
     replace_nonfinite(filled, nan_fill);
     add_sqrt_scaled_noise_on_mask(filled, mask_use, inpaint_noise_scale, rng);
     replace_nonfinite(filled, nan_fill);
@@ -329,7 +349,8 @@ int main(int argc, char **argv) {
     }
 
     std::random_device rd;
-    std::mt19937 rng(rd());
+    const uint64_t base_seed =
+        (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
 
     int inpaint_algo = cv::INPAINT_TELEA;
     std::transform(algo_name.begin(), algo_name.end(), algo_name.begin(), ::tolower);
@@ -337,8 +358,10 @@ int main(int argc, char **argv) {
         inpaint_algo = cv::INPAINT_TELEA;
     } else if (algo_name == "ns" || algo_name == "navier" || algo_name == "slow") {
         inpaint_algo = cv::INPAINT_NS;
+    } else if (algo_name == "linear") {
+        inpaint_algo = kInpaintAlgoLinear;
     } else {
-        std::cerr << "Error: --algorithm must be telea or ns\n";
+        std::cerr << "Error: --algorithm must be telea, ns, or linear\n";
         return 1;
     }
 
@@ -364,21 +387,26 @@ int main(int argc, char **argv) {
             std::cerr << "Error: no TIFF files in: " << in_path << "\n";
             return 1;
         }
-        std::cout << "Inpainting " << files.size() << " file(s)...\n";
-        int ok = 0;
-        for (size_t i = 0; i < files.size(); ++i) {
-            const fs::path &f = files[i];
-            fs::path dest = out_path / (inpaint_output_stem(f) + ".tiff");
+        const int nfiles = static_cast<int>(files.size());
+        std::atomic<int> failed{0};
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) if (nfiles > 1)
+#endif
+        for (int ii = 0; ii < nfiles; ++ii) {
+            const fs::path &f = files[static_cast<size_t>(ii)];
+            const fs::path dest = out_path / (inpaint_output_stem(f) + ".tiff");
+            const uint64_t seed =
+                base_seed ^
+                (static_cast<uint64_t>(ii + 1) * 0xD6E8FEB866D9D43DULL);
             if (process_one(f, dest, mask_u8, radius, inpaint_algo, nan_fill,
-                            inpaint_noise_scale, rng) != 0) {
-                return 1;
-            }
-            ++ok;
-            if (ok == 1 || ok == static_cast<int>(files.size()) || ok % 50 == 0) {
-                std::cout << "  " << ok << " / " << files.size() << "\r" << std::flush;
+                            inpaint_noise_scale, seed) != 0) {
+                failed.store(1, std::memory_order_relaxed);
             }
         }
-        std::cout << "\nDone -> " << out_path << "\n";
+        if (failed.load(std::memory_order_relaxed) != 0) {
+            return 1;
+        }
+        std::cout << "Done -> " << out_path.string() << "\n";
         return 0;
     }
 
@@ -388,9 +416,9 @@ int main(int argc, char **argv) {
         fs::create_directories(out_path.parent_path(), ec);
     }
     if (process_one(in_path, out_path, mask_u8, radius, inpaint_algo, nan_fill,
-                    inpaint_noise_scale, rng) != 0) {
+                    inpaint_noise_scale, base_seed) != 0) {
         return 1;
     }
-    std::cout << "Wrote: " << out_path << "\n";
+    std::cout << "Wrote: " << out_path.string() << "\n";
     return 0;
 }

@@ -238,6 +238,8 @@ if(TIFF_FOUND)
 endif()
 
 if(OpenCV_FOUND)
+    find_package(OpenMP QUIET COMPONENTS CXX)
+
     add_executable(normalize_images "${DECTRIS_APP_SRC_DIR}/normalize_images.cpp")
     target_compile_features(normalize_images PRIVATE cxx_std_17)
     if(TARGET opencv_core AND TARGET opencv_imgcodecs AND TARGET opencv_imgproc)
@@ -248,7 +250,9 @@ if(OpenCV_FOUND)
         target_link_libraries(normalize_images PRIVATE ${OpenCV_LIBS})
     endif()
 
-    add_executable(inpaint_tiff "${DECTRIS_APP_SRC_DIR}/inpaint_images.cpp")
+    add_executable(inpaint_tiff
+        "${DECTRIS_APP_SRC_DIR}/inpaint_images.cpp"
+        "${DECTRIS_APP_SRC_DIR}/linear_inpaint.cpp")
     target_compile_features(inpaint_tiff PRIVATE cxx_std_17)
     if(TARGET opencv_core AND TARGET opencv_imgcodecs AND TARGET opencv_imgproc
             AND TARGET opencv_photo)
@@ -257,6 +261,9 @@ if(OpenCV_FOUND)
     else()
         target_include_directories(inpaint_tiff PRIVATE ${OpenCV_INCLUDE_DIRS})
         target_link_libraries(inpaint_tiff PRIVATE ${OpenCV_LIBS})
+    endif()
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(inpaint_tiff PRIVATE OpenMP::OpenMP_CXX)
     endif()
 endif()
 
