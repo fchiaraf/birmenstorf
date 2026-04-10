@@ -12,9 +12,10 @@
 //   Value 0     = good pixel (leave as measured).
 //   Value > 0   = bad pixel or gap (inpaint here).
 //
-// NaN / Inf: gaps or bad math upstream often contain non-finite floats. OpenCV’s
-// float inpaint can leave NaNs if neighbours are bad; we OR those pixels into the
-// inpaint mask and replace non-finite values before/after inpainting.
+// NaN / Inf: OR into the inpaint mask; replace_nonfinite before optional outlier pass.
+// Optional --remove-outliers-median / --remove-outliers-fast: fixed |v−median| vs
+// threshold (default --outlier-threshold); fast uses cv::medianBlur + absdiff.
+// OpenCV’s float inpaint can still leave NaNs; we replace non-finite values after as well.
 //
 // Borderless vs full-frame: if width and height each differ by exactly 2 (one pixel
 // off per side), the smaller of {image, mask} is treated as borderless. We crop the
@@ -68,7 +69,18 @@ static void print_usage(const char *exe) {
         << "  --inpaint-noise-scale <float>  if > 0, add Gaussian noise on inpainted "
            "pixels only;\n"
         << "                      std dev = scale × sqrt(max(|pixel|, 1e-12)) "
-           "(default: 0 = off)\n";
+           "(default: 0 = off)\n"
+        << "  --remove-outliers-median  optional median-neighbour cleanup after "
+           "nan-fill;\n"
+        << "                      |pixel-median| > threshold (see "
+           "--outlier-threshold).\n"
+        << "  --remove-outliers-fast  same threshold idea, faster: cv::medianBlur + "
+           "absdiff;\n"
+        << "                      mutually exclusive with --remove-outliers-median.\n"
+        << "  --outlier-threshold <float>  absolute diff vs local median (default: "
+           "0.5).\n"
+        << "                      Larger = fewer replacements; smaller = more "
+           "aggressive.\n";
 }
 
 // Replace NaN and Inf so OpenCV inpaint does not spread garbage; typical
@@ -98,6 +110,91 @@ static void nonfinite_mask_u8(const cv::Mat &m32f, cv::Mat *out_u8) {
             }
         }
     }
+}
+
+// NaN/Inf or |pixel − local median| > threshold → replace with neighbour median
+// (excluding self). threshold is a fixed absolute difference in image units.
+static void remove_outliers_median(cv::Mat &m32f, cv::Mat &out_mask, int radius,
+                                   float threshold) {
+    CV_Assert(m32f.type() == CV_32FC1);
+    CV_Assert(threshold > 0.f);
+
+    out_mask = cv::Mat::zeros(m32f.size(), CV_8UC1);
+    cv::Mat result = m32f.clone();
+    const int rows = m32f.rows;
+    const int cols = m32f.cols;
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const float v = m32f.at<float>(r, c);
+
+            std::vector<float> neighbours;
+            neighbours.reserve((2 * radius + 1) * (2 * radius + 1));
+
+            for (int dr = -radius; dr <= radius; ++dr) {
+                for (int dc = -radius; dc <= radius; ++dc) {
+                    if (dr == 0 && dc == 0) {
+                        continue;
+                    }
+                    const int nr = r + dr;
+                    const int nc = c + dc;
+                    if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) {
+                        continue;
+                    }
+                    const float nv = m32f.at<float>(nr, nc);
+                    if (std::isfinite(nv)) {
+                        neighbours.push_back(nv);
+                    }
+                }
+            }
+
+            if (neighbours.empty()) {
+                continue;
+            }
+
+            const auto mid_it = neighbours.begin() +
+                                static_cast<std::ptrdiff_t>(neighbours.size() / 2);
+            std::nth_element(neighbours.begin(), mid_it, neighbours.end());
+            const float med = *mid_it;
+
+            const bool is_outlier =
+                !std::isfinite(v) || std::fabs(v - med) > threshold;
+
+            if (is_outlier) {
+                result.at<float>(r, c) = med;
+                out_mask.at<uchar>(r, c) = 255;
+            }
+        }
+    }
+    m32f = result;
+}
+
+// NaN/Inf or |pixel − local median (medianBlur)| > threshold → replace with that
+// median. Faster than remove_outliers_median; includes patch centre in the window.
+static void remove_outliers_median_fast(cv::Mat &m32f, cv::Mat &out_mask, int radius,
+                                        float threshold) {
+    CV_Assert(m32f.type() == CV_32FC1);
+    CV_Assert(threshold > 0.f);
+
+    cv::Mat finite_input = m32f.clone();
+    replace_nonfinite(finite_input, 0.f);
+
+    const int ksize = 2 * radius + 1;
+    cv::Mat median_img;
+    cv::medianBlur(finite_input, median_img, ksize);
+
+    cv::Mat diff;
+    cv::absdiff(finite_input, median_img, diff);
+
+    cv::Mat diff_hi;
+    cv::compare(diff, threshold, diff_hi, cv::CMP_GT);
+
+    cv::Mat nonfinite_u8;
+    nonfinite_mask_u8(m32f, &nonfinite_u8);
+
+    cv::bitwise_or(diff_hi, nonfinite_u8, out_mask);
+
+    median_img.copyTo(m32f, out_mask);
 }
 
 // Inpainted pixels: mask_use != 0. Noise ~ N(0, σ²) with σ = scale * sqrt(|v|).
@@ -219,26 +316,26 @@ static bool align_borderless_image_mask(cv::Mat *img32, cv::Mat *mask_u8) {
     if (iw == mw && ih == mh) {
         return true;
     }
-    static bool warned_crop_img = false;
-    static bool warned_crop_mask = false;
+    // atomics: OpenMP batch calls this in parallel; a plain static bool races and
+    // prints the same note once per racing thread.
+    static std::atomic<bool> warned_crop_img{false};
+    static std::atomic<bool> warned_crop_mask{false};
     if (iw == mw + 2 && ih == mh + 2) {
-        if (!warned_crop_img) {
+        if (!warned_crop_img.exchange(true)) {
             std::cerr
                 << "Note: images are 1 px larger per side than the mask; cropping "
                    "the outer rim from each image (borderless mask / full-frame "
                    "images).\n";
-            warned_crop_img = true;
         }
         *img32 = (*img32)(cv::Rect(1, 1, mw, mh)).clone();
         return true;
     }
     if (mw == iw + 2 && mh == ih + 2) {
-        if (!warned_crop_mask) {
+        if (!warned_crop_mask.exchange(true)) {
             std::cerr
                 << "Note: mask is 1 px larger per side than the images; cropping "
                    "the outer rim from the mask (borderless images / full-frame "
                    "mask).\n";
-            warned_crop_mask = true;
         }
         *mask_u8 = (*mask_u8)(cv::Rect(1, 1, iw, ih)).clone();
         return true;
@@ -249,6 +346,10 @@ static bool align_borderless_image_mask(cv::Mat *img32, cv::Mat *mask_u8) {
 // Sentinel: use separable linear + Jacobi inpaint (not an OpenCV enum value).
 static constexpr int kInpaintAlgoLinear = -1;
 
+// Default |pixel − neighbour median| above which a pixel is replaced (with
+// --remove-outliers-median).
+static constexpr float kDefaultOutlierThreshold = 0.5f;
+
 static int process_one(const fs::path &in_path,
                        const fs::path &out_path,
                        const cv::Mat &mask_u8,
@@ -256,6 +357,9 @@ static int process_one(const fs::path &in_path,
                        int inpaint_algo,
                        float nan_fill,
                        float inpaint_noise_scale,
+                       bool remove_outliers_median_enabled,
+                       bool remove_outliers_fast_enabled,
+                       float outlier_threshold,
                        uint64_t rng_seed) {
     cv::Mat mask_work = mask_u8.clone();
     std::mt19937 rng(rng_seed);
@@ -278,12 +382,26 @@ static int process_one(const fs::path &in_path,
         return 1;
     }
 
+    // 1) nan_mask from *original* floats (before fill). 2) OR with file mask for
+    // inpaint. 3) replace_nonfinite → NaN/Inf become nan_fill (finite). If
+    // --remove-outliers-median: those filled pixels are compared to neighbours like
+    // any other finite sample (large mismatch vs local median can be “fixed” again).
     cv::Mat nan_mask;
     nonfinite_mask_u8(img32, &nan_mask);
+
     cv::Mat mask_use;
     cv::bitwise_or(mask_work, nan_mask, mask_use);
 
     replace_nonfinite(img32, nan_fill);
+
+    if (remove_outliers_fast_enabled) {
+        cv::Mat outlier_mask;
+        remove_outliers_median_fast(img32, outlier_mask, /*radius=*/2,
+                                    outlier_threshold);
+    } else if (remove_outliers_median_enabled) {
+        cv::Mat outlier_mask;
+        remove_outliers_median(img32, outlier_mask, /*radius=*/2, outlier_threshold);
+    }
 
     cv::Mat filled;
     if (inpaint_algo == kInpaintAlgoLinear) {
@@ -311,6 +429,9 @@ int main(int argc, char **argv) {
     std::string algo_name = "telea";
     float nan_fill = 1.0f;
     float inpaint_noise_scale = 0.f;
+    bool remove_outliers_median_enabled = false;
+    bool remove_outliers_fast_enabled = false;
+    float outlier_threshold = kDefaultOutlierThreshold;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -329,6 +450,12 @@ int main(int argc, char **argv) {
         } else if (arg == "--inpaint-noise-scale" && i + 1 < argc) {
             inpaint_noise_scale =
                 static_cast<float>(std::strtod(argv[++i], nullptr));
+        } else if (arg == "--remove-outliers-median") {
+            remove_outliers_median_enabled = true;
+        } else if (arg == "--remove-outliers-fast") {
+            remove_outliers_fast_enabled = true;
+        } else if (arg == "--outlier-threshold" && i + 1 < argc) {
+            outlier_threshold = static_cast<float>(std::strtod(argv[++i], nullptr));
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -345,6 +472,15 @@ int main(int argc, char **argv) {
     }
     if (inpaint_noise_scale < 0.f) {
         std::cerr << "Error: --inpaint-noise-scale must be >= 0\n";
+        return 1;
+    }
+    if (outlier_threshold <= 0.f) {
+        std::cerr << "Error: --outlier-threshold must be > 0\n";
+        return 1;
+    }
+    if (remove_outliers_median_enabled && remove_outliers_fast_enabled) {
+        std::cerr << "Error: use only one of --remove-outliers-median and "
+                     "--remove-outliers-fast\n";
         return 1;
     }
 
@@ -399,7 +535,9 @@ int main(int argc, char **argv) {
                 base_seed ^
                 (static_cast<uint64_t>(ii + 1) * 0xD6E8FEB866D9D43DULL);
             if (process_one(f, dest, mask_u8, radius, inpaint_algo, nan_fill,
-                            inpaint_noise_scale, seed) != 0) {
+                            inpaint_noise_scale, remove_outliers_median_enabled,
+                            remove_outliers_fast_enabled, outlier_threshold,
+                            seed) != 0) {
                 failed.store(1, std::memory_order_relaxed);
             }
         }
@@ -416,7 +554,9 @@ int main(int argc, char **argv) {
         fs::create_directories(out_path.parent_path(), ec);
     }
     if (process_one(in_path, out_path, mask_u8, radius, inpaint_algo, nan_fill,
-                    inpaint_noise_scale, base_seed) != 0) {
+                    inpaint_noise_scale, remove_outliers_median_enabled,
+                    remove_outliers_fast_enabled, outlier_threshold,
+                    base_seed) != 0) {
         return 1;
     }
     std::cout << "Wrote: " << out_path.string() << "\n";
