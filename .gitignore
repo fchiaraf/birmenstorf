@@ -24,6 +24,3 @@ src/data_consumer/third_party/
 # Generated TIFF outputs (example datasets)
 example_dataset/normalized/*.tiff
 example_dataset/inpainted/*.tiff
-
-# TorchScript weights exceed GitHub's 100 MB limit; keep local or use release assets / Git LFS
-src/lama_traced_test.pt
