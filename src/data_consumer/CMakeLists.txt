@@ -265,6 +265,44 @@ if(OpenCV_FOUND)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(inpaint_tiff PRIVATE OpenMP::OpenMP_CXX)
     endif()
+
+    # Optional LaMa CLI: LibTorch + OpenCV. Download the C++ LibTorch zip from
+    # pytorch.org (Release, matching your CUDA/CPU), then configure e.g.:
+    #   cmake -DTorch_DIR=C:/libtorch/share/cmake/Torch ...
+    find_package(Torch QUIET)
+    if(Torch_FOUND)
+        add_executable(lama_inpaint "${DECTRIS_APP_SRC_DIR}/lama_inpaint.cpp")
+        target_compile_features(lama_inpaint PRIVATE cxx_std_17)
+        # C4267 (size_t → int) is triggered inside LibTorch/STL headers on MSVC x64;
+        # the link step and exe are still correct.
+        if(MSVC)
+            target_compile_options(lama_inpaint PRIVATE /wd4267)
+        endif()
+        if(TARGET Torch::Torch)
+            target_link_libraries(lama_inpaint PRIVATE Torch::Torch)
+        else()
+            target_link_libraries(lama_inpaint PRIVATE ${TORCH_LIBRARIES})
+        endif()
+        if(TARGET opencv_core AND TARGET opencv_imgcodecs AND TARGET opencv_imgproc)
+            target_link_libraries(lama_inpaint PRIVATE
+                opencv_core opencv_imgcodecs opencv_imgproc)
+        else()
+            target_include_directories(lama_inpaint PRIVATE ${OpenCV_INCLUDE_DIRS})
+            target_link_libraries(lama_inpaint PRIVATE ${OpenCV_LIBS})
+        endif()
+        if(WIN32)
+            get_filename_component(_lama_torch_root "${Torch_DIR}" DIRECTORY)
+            get_filename_component(_lama_torch_root "${_lama_torch_root}" DIRECTORY)
+            get_filename_component(_lama_torch_root "${_lama_torch_root}" DIRECTORY)
+            file(GLOB _lama_torch_dlls "${_lama_torch_root}/lib/*.dll")
+            if(_lama_torch_dlls)
+                add_custom_command(TARGET lama_inpaint POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${_lama_torch_dlls} $<TARGET_FILE_DIR:lama_inpaint>
+                    COMMENT "Copying LibTorch DLLs next to lama_inpaint.exe")
+            endif()
+        endif()
+    endif()
 endif()
 
 if(WIN32)

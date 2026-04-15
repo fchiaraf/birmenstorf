@@ -1,26 +1,2 @@
-*__pycache__*
-.venv/
-
-# Root CMake: cmake -B build -S .
-/build/
-/bin/
-/lib/
-
-Makefile
-
-*_deps/
-*CMakeCache.txt
-*CMakeFiles
-*cmake_install.cmake
-
-# In-source or stray CMake under data_consumer (prefer root /build)
-src/data_consumer/Makefile
-src/data_consumer/compile_commands.json
-
-# third_party: local configure / FetchContent / libtiff external build
-src/data_consumer/third_party/Makefile
-src/data_consumer/third_party/
-
-# Generated TIFF outputs (example datasets)
-example_dataset/normalized/*.tiff
-example_dataset/inpainted/*.tiff
+# TorchScript weights exceed GitHub's 100 MB limit; keep local or use release assets / Git LFS
+src/lama_traced_test.pt
