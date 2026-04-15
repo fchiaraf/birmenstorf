@@ -382,13 +382,8 @@ static int process_one(const fs::path &in_path,
         return 1;
     }
 
-    // 1) nan_mask from *original* floats (before fill). 2) OR with file mask for
-    // inpaint. 3) replace_nonfinite → NaN/Inf become nan_fill (finite). If
-    // --remove-outliers-median: those filled pixels are compared to neighbours like
-    // any other finite sample (large mismatch vs local median can be “fixed” again).
     cv::Mat nan_mask;
     nonfinite_mask_u8(img32, &nan_mask);
-
     cv::Mat mask_use;
     cv::bitwise_or(mask_work, nan_mask, mask_use);
 
