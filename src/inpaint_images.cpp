@@ -28,6 +28,10 @@
 // =============================================================================
 
 #include "linear_inpaint.hpp"
+#ifdef WITH_LAMA_INPAINT
+#include "lama_inpaint.hpp"
+#include <memory>
+#endif
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -44,6 +48,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _OPENMP
@@ -62,8 +67,15 @@ static void print_usage(const char *exe) {
         << "  --radius <pixels>   inpaint radius (default: 3). Try 2–5 for small "
            "defects;\n"
         << "                      larger gaps may need larger radius (slower).\n"
-        << "  --algorithm telea|ns|linear   (default: telea; linear ignores "
-           "--radius)\n"
+        << "  --algorithm telea|ns|linear"
+#ifdef WITH_LAMA_INPAINT
+        << "|lama"
+#endif
+        << "   (default: telea; linear ignores --radius)\n"
+#ifdef WITH_LAMA_INPAINT
+        << "  --lama-model <lama_traced.pt>  required when --algorithm lama (TorchScript .pt)\n"
+        << "  --lama-device cpu|cuda|auto   default: auto\n"
+#endif
         << "  --nan-fill <float>  replace NaN/Inf before inpaint and fix stragglers "
            "after (default: 1.0)\n"
         << "  --inpaint-noise-scale <float>  if > 0, add Gaussian noise on inpainted "
@@ -345,6 +357,12 @@ static bool align_borderless_image_mask(cv::Mat *img32, cv::Mat *mask_u8) {
 
 // Sentinel: use separable linear + Jacobi inpaint (not an OpenCV enum value).
 static constexpr int kInpaintAlgoLinear = -1;
+#ifdef WITH_LAMA_INPAINT
+static constexpr int kInpaintAlgoLama = -2;
+
+static std::unique_ptr<torch::jit::script::Module> g_lama_model;
+static std::unique_ptr<torch::Device> g_lama_device;
+#endif
 
 // Default |pixel − neighbour median| above which a pixel is replaced (with
 // --remove-outliers-median).
@@ -402,7 +420,22 @@ static int process_one(const fs::path &in_path,
     if (inpaint_algo == kInpaintAlgoLinear) {
         img32.copyTo(filled);
         linearInpaintMaskedRowsThenCols(filled, mask_use, nullptr);
+#ifdef WITH_LAMA_INPAINT
+    } else if (inpaint_algo == kInpaintAlgoLama) {
+        if (!g_lama_model || !g_lama_device) {
+            std::cerr << "Internal error: LaMa model not loaded.\n";
+            return 1;
+        }
+        std::string err;
+        if (!lama::inpaintGray32f(img32, mask_use, *g_lama_model, *g_lama_device, &filled,
+                                 &err)) {
+            std::cerr << "LaMa inpaint failed: " << err << "\n";
+            return 1;
+        }
     } else {
+#else
+    } else {
+#endif
         cv::inpaint(img32, mask_use, filled, radius, inpaint_algo);
     }
     replace_nonfinite(filled, nan_fill);
@@ -427,6 +460,10 @@ int main(int argc, char **argv) {
     bool remove_outliers_median_enabled = false;
     bool remove_outliers_fast_enabled = false;
     float outlier_threshold = kDefaultOutlierThreshold;
+#ifdef WITH_LAMA_INPAINT
+    fs::path lama_model_path;
+    std::string lama_device = "auto";
+#endif
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -451,6 +488,12 @@ int main(int argc, char **argv) {
             remove_outliers_fast_enabled = true;
         } else if (arg == "--outlier-threshold" && i + 1 < argc) {
             outlier_threshold = static_cast<float>(std::strtod(argv[++i], nullptr));
+#ifdef WITH_LAMA_INPAINT
+        } else if (arg == "--lama-model" && i + 1 < argc) {
+            lama_model_path = argv[++i];
+        } else if (arg == "--lama-device" && i + 1 < argc) {
+            lama_device = argv[++i];
+#endif
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -491,10 +534,48 @@ int main(int argc, char **argv) {
         inpaint_algo = cv::INPAINT_NS;
     } else if (algo_name == "linear") {
         inpaint_algo = kInpaintAlgoLinear;
+#ifdef WITH_LAMA_INPAINT
+    } else if (algo_name == "lama") {
+        inpaint_algo = kInpaintAlgoLama;
+#endif
     } else {
-        std::cerr << "Error: --algorithm must be telea, ns, or linear\n";
+        std::cerr << "Error: --algorithm must be telea, ns, or linear"
+#ifdef WITH_LAMA_INPAINT
+                     ", or lama"
+#endif
+                     << "\n";
         return 1;
     }
+
+#ifdef WITH_LAMA_INPAINT
+    if (inpaint_algo == kInpaintAlgoLama) {
+        if (lama_model_path.empty()) {
+            std::cerr << "Error: --algorithm lama requires --lama-model <path.pt>\n";
+            return 1;
+        }
+        torch::Device device(c10::DeviceType::CPU);
+        try {
+            device = lama::selectDevice(lama_device);
+        } catch (const std::exception &e) {
+            std::cerr << "Error: " << e.what() << "\n";
+            return 1;
+        }
+        torch::globalContext().setBenchmarkCuDNN(true);
+        if (device.is_cpu()) {
+            const int logical = static_cast<int>(std::thread::hardware_concurrency());
+            const int intra = std::max(1, logical / 2);
+            torch::set_num_threads(intra);
+            torch::set_num_interop_threads(1);
+        }
+        std::string err;
+        if (!lama::loadTracedModel(fs::absolute(lama_model_path), device, &g_lama_model,
+                                   &err)) {
+            std::cerr << "Error loading LaMa model: " << err << "\n";
+            return 1;
+        }
+        g_lama_device = std::make_unique<torch::Device>(device);
+    }
+#endif
 
     cv::Mat mask_u8;
     if (!load_mask_u8(mask_path, &mask_u8)) {
@@ -520,8 +601,13 @@ int main(int argc, char **argv) {
         }
         const int nfiles = static_cast<int>(files.size());
         std::atomic<int> failed{0};
+        const bool omp_ok = (nfiles > 1)
+#if defined(WITH_LAMA_INPAINT)
+                             && (inpaint_algo != kInpaintAlgoLama)
+#endif
+            ;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) if (nfiles > 1)
+#pragma omp parallel for schedule(dynamic, 1) if (omp_ok)
 #endif
         for (int ii = 0; ii < nfiles; ++ii) {
             const fs::path &f = files[static_cast<size_t>(ii)];

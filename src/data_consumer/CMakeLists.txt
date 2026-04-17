@@ -271,8 +271,30 @@ if(OpenCV_FOUND)
     #   cmake -DTorch_DIR=C:/libtorch/share/cmake/Torch ...
     find_package(Torch QUIET)
     if(Torch_FOUND)
-        add_executable(lama_inpaint "${DECTRIS_APP_SRC_DIR}/lama_inpaint.cpp")
+        add_library(lama_inpaint_lib OBJECT "${DECTRIS_APP_SRC_DIR}/lama_inpaint_minimal.cpp")
+        target_compile_features(lama_inpaint_lib PRIVATE cxx_std_17)
+        target_compile_definitions(lama_inpaint_lib PRIVATE WITH_LAMA_INPAINT=1)
+        if(MSVC)
+            target_compile_options(lama_inpaint_lib PRIVATE /wd4267)
+        endif()
+        if(TARGET Torch::Torch)
+            target_link_libraries(lama_inpaint_lib PUBLIC Torch::Torch)
+        else()
+            target_link_libraries(lama_inpaint_lib PUBLIC ${TORCH_LIBRARIES})
+        endif()
+        if(TARGET opencv_core AND TARGET opencv_imgcodecs AND TARGET opencv_imgproc)
+            target_link_libraries(lama_inpaint_lib PUBLIC
+                opencv_core opencv_imgcodecs opencv_imgproc)
+        else()
+            target_include_directories(lama_inpaint_lib PUBLIC ${OpenCV_INCLUDE_DIRS})
+            target_link_libraries(lama_inpaint_lib PUBLIC ${OpenCV_LIBS})
+        endif()
+
+        add_executable(lama_inpaint
+            "${DECTRIS_APP_SRC_DIR}/lama_inpaint_minimal.cpp"
+            "${DECTRIS_APP_SRC_DIR}/lama_inpaint.cpp")
         target_compile_features(lama_inpaint PRIVATE cxx_std_17)
+        target_compile_definitions(lama_inpaint PRIVATE WITH_LAMA_INPAINT=1)
         # C4267 (size_t → int) is triggered inside LibTorch/STL headers on MSVC x64;
         # the link step and exe are still correct.
         if(MSVC)
@@ -290,6 +312,18 @@ if(OpenCV_FOUND)
             target_include_directories(lama_inpaint PRIVATE ${OpenCV_INCLUDE_DIRS})
             target_link_libraries(lama_inpaint PRIVATE ${OpenCV_LIBS})
         endif()
+
+        target_sources(inpaint_tiff PRIVATE $<TARGET_OBJECTS:lama_inpaint_lib>)
+        target_compile_definitions(inpaint_tiff PRIVATE WITH_LAMA_INPAINT=1)
+        if(MSVC)
+            target_compile_options(inpaint_tiff PRIVATE /wd4267)
+        endif()
+        if(TARGET Torch::Torch)
+            target_link_libraries(inpaint_tiff PRIVATE Torch::Torch)
+        else()
+            target_link_libraries(inpaint_tiff PRIVATE ${TORCH_LIBRARIES})
+        endif()
+
         if(WIN32)
             get_filename_component(_lama_torch_root "${Torch_DIR}" DIRECTORY)
             get_filename_component(_lama_torch_root "${_lama_torch_root}" DIRECTORY)
@@ -300,6 +334,10 @@ if(OpenCV_FOUND)
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     ${_lama_torch_dlls} $<TARGET_FILE_DIR:lama_inpaint>
                     COMMENT "Copying LibTorch DLLs next to lama_inpaint.exe")
+                add_custom_command(TARGET inpaint_tiff POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${_lama_torch_dlls} $<TARGET_FILE_DIR:inpaint_tiff>
+                    COMMENT "Copying LibTorch DLLs next to inpaint_tiff.exe")
             endif()
         endif()
     endif()
